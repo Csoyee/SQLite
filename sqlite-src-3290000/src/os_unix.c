@@ -176,6 +176,10 @@
 */
 #define IS_LOCK_ERROR(x)  ((x != SQLITE_OK) && (x != SQLITE_BUSY))
 
+
+/*SY ADDED for DIO*/
+void * dio_buffer;
+
 /* Forward references */
 typedef struct unixShm unixShm;               /* Connection shared memory */
 typedef struct unixShmNode unixShmNode;       /* Shared memory instance */
@@ -1271,6 +1275,7 @@ static void robust_close(unixFile *pFile, int h, int lineno){
     unixLogErrorAtLine(SQLITE_IOERR_CLOSE, "close",
                        pFile ? pFile->zPath : 0, lineno);
   }
+
 }
 
 /*
@@ -3264,6 +3269,25 @@ static int nfsUnlock(sqlite3_file *id, int eFileLock){
 static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
   int got;
   int prior = 0;
+  int isDB = 0;;
+  int oriOff, oriCnt;
+
+
+  if(!strstr(id->zPath, "-journal"))  {
+  	//fprintf(stdout, "seekAndRead(%s) [%d] (%lld) (%d)\n", id->zPath, id->h, offset, cnt);
+	isDB = 1;
+	oriOff = offset;
+	oriCnt = cnt;
+
+	if(offset % 4096 != 0 ){
+	  	//fprintf(stderr, "Align Offset \n");
+		offset /=4096;	
+	}
+
+	if(cnt < 4096) {
+		cnt = 4096;
+  	}
+  }
 #if (!defined(USE_PREAD) && !defined(USE_PREAD64))
   i64 newOffset;
 #endif
@@ -3275,8 +3299,13 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
     got = osPread(id->h, pBuf, cnt, offset);
     SimulateIOError( got = -1 );
 #elif defined(USE_PREAD64)
-    got = osPread64(id->h, pBuf, cnt, offset);
+    if(isDB == 1) {
+    	got = osPread64(id->h, dio_buffer, cnt, offset);
+    } else {
+    	got = osPread64(id->h, pBuf, cnt, offset);
+    }
     SimulateIOError( got = -1 );
+    //printf("GOT(%d) :: %d\n", errno, got);
 #else
     newOffset = lseek(id->h, offset, SEEK_SET);
     SimulateIOError( newOffset = -1 );
@@ -3302,6 +3331,14 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
   TIMER_END;
   OSTRACE(("READ    %-3d %5d %7lld %llu\n",
             id->h, got+prior, offset-prior, TIMER_ELAPSED));
+ 
+  if(isDB == 1) {
+	//printf("memcpy (%d) (%d)\n", oriOff, oriCnt);
+	memcpy(pBuf, (char*)dio_buffer+oriOff, oriCnt);
+	//printf("origin Data: %s\n", (char*) buf+oriOff);
+	//printf("memcpy END: %s (%d)\n", (char*) pBuf, strlen(pBuf));
+  	got = oriCnt;
+  }
   return got+prior;
 }
 
@@ -3330,7 +3367,6 @@ static int unixRead(
        || offset+amt<=PENDING_BYTE 
   );
 #endif
-
 #if SQLITE_MAX_MMAP_SIZE>0
   /* Deal with as much of this read request as possible by transfering
   ** data from the memory mapping using memcpy().  */
@@ -3378,6 +3414,21 @@ static int seekAndWriteFd(
 ){
   int rc = 0;                     /* Value returned by system call */
 
+  int isDB = 0;;
+  // Write Buffer Alignment 맞추기. 
+  if(fd == 3)  {
+	  isDB = 1;
+	if(iOff % 4096 != 0 ){
+		//fprintf(stderr, "Align Offset \n");
+		iOff /=4096;	
+	}
+
+	if(nBuf < 4096) {
+		nBuf = 4096;
+  	}
+        //fprintf(stdout, "seekAndWrite [%d] (%lld) (%d)\n", fd, iOff, nBuf);
+	memcpy(dio_buffer, pBuf, nBuf);
+  }
   assert( nBuf==(nBuf&0x1ffff) );
   assert( fd>2 );
   assert( piErrno!=0 );
@@ -3387,7 +3438,12 @@ static int seekAndWriteFd(
 #if defined(USE_PREAD)
   do{ rc = (int)osPwrite(fd, pBuf, nBuf, iOff); }while( rc<0 && errno==EINTR );
 #elif defined(USE_PREAD64)
-  do{ rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}while( rc<0 && errno==EINTR);
+  do{ 
+    if(isDB == 1) {  
+      rc = (int)osPwrite64(fd, dio_buffer, nBuf, iOff);
+//printf("ERRNO : %d (%d), (%d), (%X)\n", errno, nBuf, iOff, buf);
+    } else {
+      rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}}while( rc<0 && errno==EINTR);
 #else
   do{
     i64 iSeek = lseek(fd, iOff, SEEK_SET);
@@ -3402,6 +3458,7 @@ static int seekAndWriteFd(
 
   TIMER_END;
   OSTRACE(("WRITE   %-3d %5d %7lld %llu\n", fd, rc, iOff, TIMER_ELAPSED));
+  //printf("WRITE   %-3d %5d %7lld %llu\n", fd, rc, iOff, TIMER_ELAPSED);
 
   if( rc<0 ) *piErrno = errno;
   return rc;
@@ -3482,7 +3539,6 @@ static int unixWrite(
     }
   }
 #endif
- 
   while( (wrote = seekAndWrite(pFile, offset, pBuf, amt))<amt && wrote>0 ){
     amt -= wrote;
     offset += wrote;
@@ -3711,6 +3767,7 @@ static int unixSync(sqlite3_file *id, int flags){
 
   assert( pFile );
   OSTRACE(("SYNC    %-3d\n", pFile->h));
+  //printf("SYNC   %-3d\n", pFile->h);
   rc = full_fsync(pFile->h, isFullsync, isDataOnly);
   SimulateIOError( rc=1 );
   if( rc ){
@@ -6022,6 +6079,15 @@ static int unixOpen(
   if( isCreate )    openFlags |= O_CREAT;
   if( isExclusive ) openFlags |= (O_EXCL|O_NOFOLLOW);
   openFlags |= (O_LARGEFILE|O_BINARY);
+
+  if(eType == SQLITE_OPEN_MAIN_DB) {
+  	openFlags |= O_DIRECT;
+	
+	// Assign Aligned Buffer -- page size = 4096
+	if(posix_memalign(&dio_buffer, 4096, 4096)) {
+		fprintf(stderr, "allocation failed\n");
+	}
+  }
 
   if( fd<0 ){
     mode_t openMode;              /* Permissions to create file with */
