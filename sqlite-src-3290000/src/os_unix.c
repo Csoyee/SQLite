@@ -3334,7 +3334,7 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
  
   if(isDB == 1) {
 	//printf("memcpy (%d) (%d)\n", oriOff, oriCnt);
-	memcpy(pBuf, (char*)dio_buffer+oriOff, oriCnt);
+	memcpy(pBuf, dio_buffer+oriOff%4096, oriCnt);
 	//printf("origin Data: %s\n", (char*) buf+oriOff);
 	//printf("memcpy END: %s (%d)\n", (char*) pBuf, strlen(pBuf));
   	got = oriCnt;
