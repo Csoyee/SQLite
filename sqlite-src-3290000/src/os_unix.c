@@ -179,6 +179,7 @@
 
 /*SY ADDED for DIO*/
 void * dio_buffer;
+int dio_flag = 0;
 
 /* Forward references */
 typedef struct unixShm unixShm;               /* Connection shared memory */
@@ -3273,8 +3274,7 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
   int oriOff, oriCnt;
 
 
-  if(!strstr(id->zPath, "-journal"))  {
-  	//fprintf(stdout, "seekAndRead(%s) [%d] (%lld) (%d)\n", id->zPath, id->h, offset, cnt);
+  if(dio_flag == 1 && !strstr(id->zPath, "-journal"))  {
 	isDB = 1;
 	oriOff = offset;
 	oriCnt = cnt;
@@ -3305,7 +3305,7 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
     	got = osPread64(id->h, pBuf, cnt, offset);
     }
     SimulateIOError( got = -1 );
-    //printf("GOT(%d) :: %d\n", errno, got);
+    
 #else
     newOffset = lseek(id->h, offset, SEEK_SET);
     SimulateIOError( newOffset = -1 );
@@ -3334,10 +3334,11 @@ static int seekAndRead(unixFile *id, sqlite3_int64 offset, void *pBuf, int cnt){
  
   if(isDB == 1) {
 	//printf("memcpy (%d) (%d)\n", oriOff, oriCnt);
-	memcpy(pBuf, dio_buffer+oriOff%4096, oriCnt);
-	//printf("origin Data: %s\n", (char*) buf+oriOff);
-	//printf("memcpy END: %s (%d)\n", (char*) pBuf, strlen(pBuf));
-  	got = oriCnt;
+	memcpy(pBuf, dio_buffer+(oriOff%4096), oriCnt);
+	//printf("origin Data: %s\n", (char*) dio_buffer+oriOff);
+	//printf("memcpy END: %s (%ld)\n", (char*) pBuf, strlen(pBuf));
+  	if(got > oriCnt)
+		got = oriCnt;
   }
   return got+prior;
 }
@@ -3410,13 +3411,14 @@ static int seekAndWriteFd(
   i64 iOff,                       /* File offset to begin writing at */
   const void *pBuf,               /* Copy data from this buffer to the file */
   int nBuf,                       /* Size of buffer pBuf in bytes */
-  int *piErrno                    /* OUT: Error number if error occurs */
+  int *piErrno,                    /* OUT: Error number if error occurs */
+  const char* zName
 ){
   int rc = 0;                     /* Value returned by system call */
 
   int isDB = 0;;
   // Write Buffer Alignment 맞추기. 
-  if(fd == 3)  {
+  if(dio_flag == 1 && !strstr(zName, "-journal"))  {
 	  isDB = 1;
 	if(iOff % 4096 != 0 ){
 		//fprintf(stderr, "Align Offset \n");
@@ -3441,7 +3443,7 @@ static int seekAndWriteFd(
   do{ 
     if(isDB == 1) {  
       rc = (int)osPwrite64(fd, dio_buffer, nBuf, iOff);
-//printf("ERRNO : %d (%d), (%d), (%X)\n", errno, nBuf, iOff, buf);
+	//printf("ERRNO : %d (%d), (%lld)\n", errno, nBuf, iOff);
     } else {
       rc = (int)osPwrite64(fd, pBuf, nBuf, iOff);}}while( rc<0 && errno==EINTR);
 #else
@@ -3473,7 +3475,7 @@ static int seekAndWriteFd(
 ** is set before returning.
 */
 static int seekAndWrite(unixFile *id, i64 offset, const void *pBuf, int cnt){
-  return seekAndWriteFd(id->h, offset, pBuf, cnt, &id->lastErrno);
+  return seekAndWriteFd(id->h, offset, pBuf, cnt, &id->lastErrno, id->zPath);
 }
 
 
@@ -4763,7 +4765,7 @@ static int unixShmMap(
           assert( (nByte % pgsz)==0 );
           for(iPg=(sStat.st_size/pgsz); iPg<(nByte/pgsz); iPg++){
             int x = 0;
-            if( seekAndWriteFd(pShmNode->hShm, iPg*pgsz + pgsz-1,"",1,&x)!=1 ){
+            if( seekAndWriteFd(pShmNode->hShm, iPg*pgsz + pgsz-1,"",1,&x, pShmNode->zFilename)!=1 ){
               const char *zFile = pShmNode->zFilename;
               rc = unixLogError(SQLITE_IOERR_SHMSIZE, "write", zFile);
               goto shmpage_out;
@@ -6082,7 +6084,7 @@ static int unixOpen(
 
   if(eType == SQLITE_OPEN_MAIN_DB) {
   	openFlags |= O_DIRECT;
-	
+ 	dio_flag = 1;	
 	// Assign Aligned Buffer -- page size = 4096
 	if(posix_memalign(&dio_buffer, 4096, 4096)) {
 		fprintf(stderr, "allocation failed\n");
